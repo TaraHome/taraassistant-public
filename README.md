@@ -187,3 +187,18 @@ If you prefer your smart home quiet and predictable, Tara aims to stay on that s
 
 
 Automation is mostly about modeling habits without annoying people. Better primitives and more transparent behavior win.
+
+<img width="1211" height="1450" alt="AI Provider 2" src="https://github.com/user-attachments/assets/bf87014b-5246-404c-bcb7-73dc45c53c28" />
+<img width="1166" height="1101" alt="Automation idea based on usage" src="https://github.com/user-attachments/assets/c28ba4a3-aeb4-49fe-8083-ace8fb734228" />
+<img width="1158" height="825" alt="autoamtions ideas based on the devices you have" src="https://github.com/user-attachments/assets/b20040f6-db95-4a46-9f1b-2b1d56ef4e0e" />
+<img width="755" height="1194" alt="Thresholds and safety Guardrails" src="https://github.com/user-attachments/assets/13bf01d6-417e-475a-9086-0aea604d77c8" />
+<img width="872" height="881" alt="validate connection" src="https://github.com/user-attachments/assets/c7a34d7f-c4d3-4cdc-962e-a9e67137a36f" />
+<img width="417" height="580" alt="LLM logs" src="https://github.com/user-attachments/assets/94faa467-5016-44b5-8860-d6646ab53223" />
+<img width="563" height="854" alt="Home page2" src="https://github.com/user-attachments/assets/b9fab222-4c15-44f6-b53a-2083ea78c36d" />
+<img width="393" height="489" alt="HA logs" src="https://github.com/user-attachments/assets/a4b88c4c-e69c-4b7f-8668-cecee3398849" />
+<img width="764" height="912" alt="HA connection" src="https://github.com/user-attachments/assets/9606116d-8e32-4cdd-a5a0-b2fb8e665cb8" />
+
+
+
+
+
