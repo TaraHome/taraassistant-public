@@ -45,6 +45,20 @@ http://localhost:8000
 Connect to your Home Assistant instance, configure a provider if you want one, and start watching what Tara suggests.
 
 
+HAOS-specific installation section:
+
+     1 │# For Home Assistant OS users:
+     2 │sudo docker run -d \
+     3 │  --name tara-assistant \
+     4 │  --restart unless-stopped \
+     5 │  -p 8000:8000 \
+     6 │  --user root \
+     7 │  -v /mnt/data/docker/tara-assistant:/app/data \
+     8 │  ghcr.io/tarahome/taraassistant:latest
+
+
+    Note for HAOS users: You may see an "Unsupported software" warning in Home Assistant. This 
+    is normal when running additional Docker containers and can be safely ignored.
 
 
 ## Architecture
