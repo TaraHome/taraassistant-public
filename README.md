@@ -72,7 +72,7 @@ Tara FastAPI Server (local)
           v
 
 LLM Provider (optional)
-  OpenAI / Anthropic / other
+  OpenAI / Anthropic / Google / Ollama / OpenAI-compatible 
 
           |
           v
