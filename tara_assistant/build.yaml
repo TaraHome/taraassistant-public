@@ -1,0 +1,4 @@
+build_from:
+  amd64: ghcr.io/tarahome/taraassistant:latest
+  aarch64: ghcr.io/tarahome/taraassistant:latest
+  armv7: ghcr.io/tarahome/taraassistant:latest

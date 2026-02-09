@@ -1,0 +1,37 @@
+configuration:
+  ai_provider:
+    name: AI Provider
+    description: Which AI provider to use for natural language processing
+  openai_api_key:
+    name: OpenAI API Key
+    description: Your OpenAI API key (required if provider is openai)
+  openai_model:
+    name: OpenAI Model
+    description: OpenAI model to use (e.g. gpt-4o)
+  anthropic_api_key:
+    name: Anthropic API Key
+    description: Your Anthropic API key (required if provider is anthropic)
+  anthropic_model:
+    name: Anthropic Model
+    description: Anthropic model to use (e.g. claude-sonnet-4-20250514)
+  google_api_key:
+    name: Google API Key
+    description: Your Google AI API key (required if provider is google)
+  google_model:
+    name: Google Model
+    description: Google model to use (e.g. gemini-2.0-flash-exp)
+  ollama_host:
+    name: Ollama Host
+    description: URL of your Ollama instance (required if provider is ollama)
+  ollama_model:
+    name: Ollama Model
+    description: Ollama model to use (e.g. llama3.1)
+  openai_compatible_host:
+    name: OpenAI-Compatible Host
+    description: URL of your OpenAI-compatible server (e.g. LM Studio, vLLM)
+  openai_compatible_api_key:
+    name: OpenAI-Compatible API Key
+    description: API key for your OpenAI-compatible server (optional for some servers)
+  openai_compatible_model:
+    name: OpenAI-Compatible Model
+    description: Model name on your OpenAI-compatible server

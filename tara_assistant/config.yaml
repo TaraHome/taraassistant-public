@@ -1,0 +1,48 @@
+name: Tara Assistant
+version: 1.0.0
+slug: tara_assistant
+description: AI-powered smart home assistant that learns your routines and generates Home Assistant automations
+url: https://github.com/TaraHome/taraassistant-public
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+ingress: true
+ingress_port: 8000
+panel_icon: mdi:robot
+panel_title: Tara
+homeassistant_api: true
+map:
+  - addon_config:rw
+ports:
+  8000/tcp: null
+ports_description:
+  8000/tcp: Tara Assistant web UI (not needed if using ingress)
+options:
+  ai_provider: openai
+  openai_api_key: ""
+  openai_model: gpt-4o
+  anthropic_api_key: ""
+  anthropic_model: claude-sonnet-4-20250514
+  google_api_key: ""
+  google_model: gemini-2.0-flash-exp
+  ollama_host: http://localhost:11434
+  ollama_model: llama3.1
+  openai_compatible_host: ""
+  openai_compatible_api_key: ""
+  openai_compatible_model: ""
+schema:
+  ai_provider: list(openai|anthropic|ollama|google|openai_compatible)
+  openai_api_key: str?
+  openai_model: str?
+  anthropic_api_key: str?
+  anthropic_model: str?
+  google_api_key: str?
+  google_model: str?
+  ollama_host: url?
+  ollama_model: str?
+  openai_compatible_host: str?
+  openai_compatible_api_key: str?
+  openai_compatible_model: str?
