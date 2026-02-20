@@ -4,6 +4,7 @@ import time
 from typing import Any
 from dataclasses import dataclass
 from app.config import get_settings
+from app.entity_filters import get_excluded_entity_patterns, is_entity_excluded
 from app.usage import get_usage_tracker
 
 
@@ -23,6 +24,7 @@ class HomeAssistantClient:
         settings = get_settings()
         self.base_url = settings.ha_url.rstrip("/")
         self.token = settings.ha_token
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Content-Type": "application/json",
@@ -78,10 +80,11 @@ class HomeAssistantClient:
             return data[:max_items] + [f"... and {len(data) - max_items} more items"]
         return data
     
-    async def get_states(self) -> list[HAState]:
+    async def get_states(self, include_excluded: bool = False) -> list[HAState]:
         """Get all entity states."""
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
         data = await self._request("GET", "/api/states")
-        return [
+        states = [
             HAState(
                 entity_id=item["entity_id"],
                 state=item["state"],
@@ -90,9 +93,20 @@ class HomeAssistantClient:
             )
             for item in data
         ]
+        if include_excluded:
+            return states
+        return [
+            state
+            for state in states
+            if not is_entity_excluded(state.entity_id, self.excluded_entity_patterns)
+        ]
     
     async def get_state(self, entity_id: str) -> HAState | None:
         """Get state for a specific entity."""
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
+        if is_entity_excluded(entity_id, self.excluded_entity_patterns):
+            return None
+
         try:
             data = await self._request("GET", f"/api/states/{entity_id}")
             return HAState(
@@ -112,6 +126,13 @@ class HomeAssistantClient:
         **service_data
     ) -> dict:
         """Call a Home Assistant service."""
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
+        if entity_id and is_entity_excluded(entity_id, self.excluded_entity_patterns):
+            return {
+                "success": False,
+                "error": f"Entity {entity_id} is excluded from Tara processing"
+            }
+
         data = {**service_data}
         if entity_id:
             data["entity_id"] = entity_id
@@ -303,6 +324,9 @@ class HomeAssistantTools:
             elif tool_name == "call_service":
                 entity_id = arguments.get("entity_id")
                 service_data = arguments.get("service_data", {})
+                excluded_patterns = get_excluded_entity_patterns()
+                if entity_id and is_entity_excluded(entity_id, excluded_patterns):
+                    return f"Entity {entity_id} is excluded from Tara processing"
 
                 # Get current state before the call for pattern tracking
                 old_state = None
@@ -319,6 +343,8 @@ class HomeAssistantTools:
                     entity_id=entity_id,
                     **service_data
                 )
+                if not result.get("success", False):
+                    return result.get("error", "Service call blocked")
 
                 # Record event for pattern tracking
                 if entity_id:

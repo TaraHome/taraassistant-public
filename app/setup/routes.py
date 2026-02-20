@@ -88,15 +88,20 @@ async def validate_home_assistant(request: ValidateHARequest):
 async def save_config(request: SaveConfigRequest):
     """Save configuration (encrypted)."""
     try:
+        storage = ConfigStorage()
+        existing_config = storage.load()
+        excluded_entities = request.excluded_entities
+        if not excluded_entities and existing_config:
+            excluded_entities = existing_config.excluded_entities
+
         # Build StoredConfig from request
         config = StoredConfig(
             provider=request.provider,
             limits=request.limits,
             home_assistant=request.home_assistant,
-            app_name=request.app_name
+            app_name=request.app_name,
+            excluded_entities=excluded_entities
         )
-
-        storage = ConfigStorage()
         storage.save(config)
 
         # Clear caches so new config is loaded
@@ -132,7 +137,8 @@ async def save_limits(request: SaveLimitsRequest):
             provider=existing_config.provider,
             limits=request.limits,
             home_assistant=existing_config.home_assistant,
-            app_name=existing_config.app_name
+            app_name=existing_config.app_name,
+            excluded_entities=existing_config.excluded_entities
         )
 
         storage.save(updated_config)
@@ -181,5 +187,6 @@ async def get_current_config():
         "model": config.provider.model,
         "limits": config.limits.model_dump(),
         "home_assistant_url": config.home_assistant.url,
-        "app_name": config.app_name
+        "app_name": config.app_name,
+        "excluded_entities": config.excluded_entities
     }

@@ -7,6 +7,7 @@ from typing import Optional
 
 import httpx
 
+from app.entity_filters import get_excluded_entity_patterns, is_entity_excluded
 from app.patterns.database import get_pattern_db
 from app.patterns.models import DeviceEvent, EventSource
 
@@ -37,6 +38,7 @@ class EventCollector:
         self.ha_url = ha_url.rstrip("/")
         self.ha_token = ha_token
         self.db = get_pattern_db()
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
 
     def record_assistant_event(
         self,
@@ -44,8 +46,12 @@ class EventCollector:
         old_state: Optional[str],
         new_state: str,
         attributes: Optional[dict] = None,
-    ) -> int:
+    ) -> Optional[int]:
         """Record an event triggered by the assistant. Returns event ID."""
+        if is_entity_excluded(entity_id, self.excluded_entity_patterns):
+            logger.debug(f"Skipping excluded assistant event: {entity_id}")
+            return None
+
         domain = entity_id.split(".")[0] if "." in entity_id else "unknown"
 
         event = DeviceEvent(
@@ -80,7 +86,10 @@ class EventCollector:
             for state in states:
                 entity_id = state.get("entity_id", "")
                 domain = entity_id.split(".")[0] if "." in entity_id else ""
-                if domain in self.TRACKED_DOMAINS:
+                if (
+                    domain in self.TRACKED_DOMAINS
+                    and not is_entity_excluded(entity_id, self.excluded_entity_patterns)
+                ):
                     entity_ids.append(entity_id)
 
             return entity_ids
@@ -99,6 +108,7 @@ class EventCollector:
         Returns: (count_synced, error_message or None)
         """
         start_time = time.time()
+        self.excluded_entity_patterns = get_excluded_entity_patterns()
 
         # Determine start timestamp - use last sync or fall back to hours_back
         last_sync = self.db.get_last_sync_timestamp()
@@ -191,6 +201,8 @@ class EventCollector:
 
             # Skip domains we don't track
             if domain not in self.TRACKED_DOMAINS:
+                continue
+            if is_entity_excluded(entity_id, self.excluded_entity_patterns):
                 continue
 
             # Process state changes

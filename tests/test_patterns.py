@@ -16,6 +16,30 @@ os.environ.setdefault("HA_URL", "http://localhost:8123")
 os.environ.setdefault("HA_TOKEN", "test_token")
 
 
+class TestEntityFilters(unittest.TestCase):
+    """Tests for entity exclusion helpers."""
+
+    def test_is_entity_excluded_exact_match(self):
+        from app.entity_filters import is_entity_excluded
+
+        self.assertTrue(
+            is_entity_excluded("light.bedroom", ["light.bedroom"])
+        )
+        self.assertFalse(
+            is_entity_excluded("light.kitchen", ["light.bedroom"])
+        )
+
+    def test_is_entity_excluded_wildcard_match(self):
+        from app.entity_filters import is_entity_excluded
+
+        self.assertTrue(
+            is_entity_excluded("camera.driveway", ["camera.*"])
+        )
+        self.assertFalse(
+            is_entity_excluded("light.driveway", ["camera.*"])
+        )
+
+
 class TestPatternModels(unittest.TestCase):
     """Tests for pattern tracking Pydantic models."""
 
@@ -807,6 +831,31 @@ class TestEventCollector(unittest.TestCase):
         self.assertEqual(events[0].entity_id, "light.bedroom")
         self.assertEqual(events[0].source, EventSource.ASSISTANT)
 
+    def test_record_assistant_event_skips_excluded_entity(self):
+        """Test excluded entities are not recorded for assistant-triggered events."""
+        from app.patterns.collector import EventCollector
+
+        db = self._get_test_db()
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = db
+        collector.excluded_entity_patterns = ["light.secret_*"]
+
+        event_id = collector.record_assistant_event(
+            entity_id="light.secret_room",
+            old_state="off",
+            new_state="on",
+            attributes={"brightness": 200},
+        )
+
+        self.assertIsNone(event_id)
+
+        events = db.get_events_in_range(
+            datetime.utcnow() - timedelta(hours=1),
+            datetime.utcnow() + timedelta(hours=1),
+        )
+        self.assertEqual(len(events), 0)
+
     def test_parse_history_data(self):
         """Test parsing Home Assistant history API response."""
         from app.patterns.collector import EventCollector
@@ -919,6 +968,39 @@ class TestEventCollector(unittest.TestCase):
         events = collector._parse_history_data(history_data)
 
         # Only light should be included
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].entity_id, "light.room")
+
+    def test_parse_history_data_skips_excluded_entity(self):
+        """Test that excluded entities are filtered during history parsing."""
+        from app.patterns.collector import EventCollector
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.excluded_entity_patterns = ["light.secret_*"]
+
+        history_data = [
+            [
+                {
+                    "entity_id": "light.secret_room",
+                    "state": "on",
+                    "last_changed": "2024-01-15T10:00:00+00:00",
+                    "context": {},
+                    "attributes": {},
+                },
+            ],
+            [
+                {
+                    "entity_id": "light.room",
+                    "state": "on",
+                    "last_changed": "2024-01-15T10:00:00+00:00",
+                    "context": {},
+                    "attributes": {},
+                },
+            ],
+        ]
+
+        events = collector._parse_history_data(history_data)
+
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].entity_id, "light.room")
 
@@ -1157,6 +1239,7 @@ def run_tests():
 
     # Add all test classes
     test_classes = [
+        TestEntityFilters,
         TestPatternModels,
         TestPatternDatabase,
         TestPatternDetector,
