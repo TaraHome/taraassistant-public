@@ -9,6 +9,7 @@ from typing import Optional, List
 import httpx
 
 from app.setup.encryption import EncryptionManager
+from app.entity_filters import get_excluded_entity_patterns, is_entity_excluded
 
 
 @dataclass
@@ -61,6 +62,7 @@ class EntityCache:
         self.encryption = EncryptionManager(passphrase)
         self.cache_path = self.CACHE_DIR / self.CACHE_FILE
         self._index: Optional[EntityIndex] = None
+        self._excluded_entity_patterns = get_excluded_entity_patterns()
 
     def exists(self) -> bool:
         """Check if entity cache exists."""
@@ -133,6 +135,7 @@ class EntityCache:
             Tuple of (success, error_message)
         """
         ha_url = ha_url.rstrip("/")
+        self._excluded_entity_patterns = get_excluded_entity_patterns()
 
         try:
             async with httpx.AsyncClient(timeout=self.FETCH_TIMEOUT) as client:
@@ -151,6 +154,8 @@ class EntityCache:
             for state in states:
                 entity_id = state.get("entity_id", "")
                 if not entity_id:
+                    continue
+                if is_entity_excluded(entity_id, self._excluded_entity_patterns):
                     continue
 
                 domain = entity_id.split(".")[0] if "." in entity_id else "unknown"

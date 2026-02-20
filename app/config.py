@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Home Assistant
     ha_url: str = Field(default="http://localhost:8123")
     ha_token: str = Field(default="")
+    excluded_entities: str = Field(default="")
 
     # Rate limiting
     max_tokens_per_response: int = Field(default=4096)
@@ -96,6 +97,7 @@ def get_settings() -> Settings:
                 "guardrails_threshold": getattr(stored_config.limits, 'guardrails_threshold', 70),
                 "ha_url": stored_config.home_assistant.url,
                 "ha_token": stored_config.home_assistant.token,
+                "excluded_entities": getattr(stored_config, "excluded_entities", ""),
             }
 
             # Provider-specific settings

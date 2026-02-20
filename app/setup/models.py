@@ -70,6 +70,7 @@ class StoredConfig(BaseModel):
     limits: LimitsConfig
     home_assistant: HomeAssistantConfig
     app_name: str = "TaraHome AI Assistant"
+    excluded_entities: str = ""
 
 
 # Request/Response models for validation endpoints
@@ -112,6 +113,7 @@ class SaveConfigRequest(BaseModel):
     limits: LimitsConfig
     home_assistant: HomeAssistantConfig
     app_name: str = "TaraHome AI Assistant"
+    excluded_entities: str = ""
 
 
 class SaveLimitsRequest(BaseModel):

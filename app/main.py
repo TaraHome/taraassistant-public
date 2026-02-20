@@ -1,9 +1,12 @@
 """FastAPI web server for TaraHome AI Assistant."""
+import asyncio
 import json
 import logging
 import re
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -272,6 +275,74 @@ def _load_scripts_for_prompt(available_domains=None) -> list[str]:
     return lines
 
 
+def _to_ws_url(ha_url: str) -> str:
+    parsed = urlparse(ha_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = ""
+    return f"{scheme}://{parsed.netloc}{path}/api/websocket"
+
+
+async def _fetch_ha_registry_maps(
+    ha_url: str,
+    ha_token: str,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Fetch entity->device_id and device_id->device_name maps from HA websocket API."""
+    try:
+        import websockets
+    except Exception:
+        return {}, {}
+
+    ws_url = _to_ws_url(ha_url)
+    entity_to_device_id: dict[str, str] = {}
+    device_id_to_name: dict[str, str] = {}
+
+    async with websockets.connect(
+        ws_url,
+        open_timeout=6,
+        ping_timeout=6,
+        max_size=None,  # HA registries can exceed default websocket frame limits
+    ) as ws:
+        auth_required = json.loads(await asyncio.wait_for(ws.recv(), timeout=4))
+        if auth_required.get("type") != "auth_required":
+            return {}, {}
+
+        await ws.send(json.dumps({"type": "auth", "access_token": ha_token}))
+        auth_response = json.loads(await asyncio.wait_for(ws.recv(), timeout=4))
+        if auth_response.get("type") != "auth_ok":
+            return {}, {}
+
+        async def send_and_wait(msg_id: int, msg_type: str):
+            await ws.send(json.dumps({"id": msg_id, "type": msg_type}))
+            while True:
+                data = json.loads(await asyncio.wait_for(ws.recv(), timeout=6))
+                if data.get("id") == msg_id and data.get("type") == "result":
+                    return data.get("result", [])
+
+        devices = await send_and_wait(1, "config/device_registry/list")
+        entities = await send_and_wait(2, "config/entity_registry/list")
+
+        for device in devices or []:
+            device_id = device.get("id")
+            if not device_id:
+                continue
+            name = (
+                device.get("name_by_user")
+                or device.get("name")
+                or device_id
+            )
+            device_id_to_name[device_id] = name
+
+        for entity in entities or []:
+            entity_id = entity.get("entity_id")
+            device_id = entity.get("device_id")
+            if entity_id and device_id:
+                entity_to_device_id[entity_id] = device_id
+
+    return entity_to_device_id, device_id_to_name
+
+
 class ChatRequest(BaseModel):
     """Chat request model."""
     message: str
@@ -283,6 +354,11 @@ class ChatResponse(BaseModel):
     response: str
     success: bool = True
     session_id: str = "default"
+
+
+class ExcludedEntitiesRequest(BaseModel):
+    """Request model for updating excluded entities."""
+    entity_ids: List[str] = []
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1008,6 +1084,7 @@ async def home():
             color: var(--muted-foreground);
         }}
 
+
         /* ===== INSIGHTS PANEL ===== */
         .insights-panel {{
             position: fixed;
@@ -1257,6 +1334,7 @@ async def home():
             .message {{
                 max-width: 90%;
             }}
+
         }}
     </style>
 </head>
@@ -1355,7 +1433,24 @@ async def home():
                     <div id="devices-card" class="card" style="padding: 20px;">
                         <div class="status-header">
                             <h3 class="section-title">Devices</h3>
-                            <span id="device-count" class="status-count">Loading...</span>
+                            <div style="display: flex; gap: 8px; align-items: center;">
+                                <button class="header-btn" onclick="syncDevices()" style="padding: 6px 12px; font-size: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); cursor: pointer;">Sync Now</button>
+                                <button class="header-btn" onclick="window.location.href='/devices-manager'" style="padding: 6px 12px; font-size: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); cursor: pointer;">Manage</button>
+                                <span id="device-count" class="status-count">Loading...</span>
+                            </div>
+                        </div>
+                        <div class="device-controls" style="display: grid; gap: 8px; margin: 10px 0 12px 0;">
+                            <input
+                                type="text"
+                                id="device-filter-text"
+                                placeholder="Search devices by name, ID, or domain"
+                                style="width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--background); color: var(--foreground); font-size: 0.8rem;"
+                                oninput="renderDeviceList()"
+                            />
+                            <label style="display: flex; align-items: center; gap: 8px; font-size: 0.8rem; color: var(--muted-foreground);">
+                                <input type="checkbox" id="show-excluded-toggle" onchange="renderDeviceList()" />
+                                Show excluded devices
+                            </label>
                         </div>
                         <div id="device-status-list" class="device-list"></div>
                     </div>
@@ -1393,6 +1488,7 @@ async def home():
         const sendBtn = document.getElementById('send');
         let tokenChart = null;
         let panelVisible = false;
+        let allDevices = [];
 
         input.addEventListener('keypress', e => {{
             if (e.key === 'Enter') sendMessage();
@@ -1642,33 +1738,141 @@ async def home():
             try {{
                 const res = await fetch('/api/ui/devices');
                 const data = await res.json();
-                const devices = data.devices || [];
-
-                if (!devices.length) {{
-                    list.innerHTML = '<div class=\"action-empty\">No devices available.</div>';
-                    count.textContent = data.cached ? '0 devices' : 'Not cached';
-                    return;
-                }}
-
-                list.innerHTML = '';
-                devices.forEach(device => {{
-                    const row = document.createElement('div');
-                    row.className = 'device-row';
-                    row.innerHTML = `
-                        <div class=\"device-meta\">
-                            <div>${{escapeHtml(device.friendly_name)}}</div>
-                            <div class=\"device-domain\">${{escapeHtml(device.domain)}}</div>
-                        </div>
-                        <div class=\"device-state\">${{escapeHtml(device.state)}}</div>
-                    `;
-                    list.appendChild(row);
-                }});
-
-                count.textContent = `${{devices.length}} devices`;
+                allDevices = data.devices || [];
+                renderDeviceList();
             }} catch (e) {{
                 list.innerHTML = '<div class=\"action-empty\">Could not load devices.</div>';
                 count.textContent = 'Unavailable';
             }}
+        }}
+
+        function renderDeviceList() {{
+            const list = document.getElementById('device-status-list');
+            const count = document.getElementById('device-count');
+            const searchInput = document.getElementById('device-filter-text');
+            const showExcludedToggle = document.getElementById('show-excluded-toggle');
+            if (!list || !count) return;
+
+            const search = (searchInput?.value || '').trim().toLowerCase();
+            const showExcluded = !!showExcludedToggle?.checked;
+            const filtered = allDevices.filter(device => {{
+                const matchesVisibility = showExcluded || !device.excluded;
+                if (!matchesVisibility) return false;
+                if (!search) return true;
+                const haystack = [
+                    device.friendly_name || '',
+                    device.entity_id || '',
+                    device.domain || '',
+                ].join(' ').toLowerCase();
+                return haystack.includes(search);
+            }});
+
+            if (!filtered.length) {{
+                list.innerHTML = '<div class=\"action-empty\">No devices match your filters.</div>';
+            }} else {{
+                list.innerHTML = '';
+                filtered.forEach(device => {{
+                    const row = document.createElement('div');
+                    row.className = 'device-row';
+                    if (device.excluded) {{
+                        row.style.opacity = '0.72';
+                    }}
+
+                    const meta = document.createElement('div');
+                    meta.className = 'device-meta';
+
+                    const friendly = document.createElement('div');
+                    friendly.textContent = device.friendly_name || device.entity_id;
+
+                    const domain = document.createElement('div');
+                    domain.className = 'device-domain';
+                    domain.textContent = `${{device.domain || 'unknown'}} · ${{device.entity_id}}`;
+
+                    meta.appendChild(friendly);
+                    meta.appendChild(domain);
+
+                    const right = document.createElement('div');
+                    right.style.display = 'flex';
+                    right.style.alignItems = 'center';
+                    right.style.gap = '10px';
+
+                    const state = document.createElement('div');
+                    state.className = 'device-state ' + String(device.state || '').toLowerCase().replace(/\\s+/g, '_');
+                    state.textContent = device.state || 'unknown';
+
+                    const label = document.createElement('label');
+                    label.style.display = 'flex';
+                    label.style.alignItems = 'center';
+                    label.style.gap = '5px';
+                    label.style.fontSize = '0.74rem';
+                    label.style.color = 'var(--muted-foreground)';
+
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = !!device.excluded;
+                    checkbox.onchange = () => toggleDeviceExcluded(device.entity_id, checkbox.checked);
+
+                    const text = document.createElement('span');
+                    text.textContent = 'Excluded';
+
+                    label.appendChild(checkbox);
+                    label.appendChild(text);
+                    right.appendChild(state);
+                    right.appendChild(label);
+
+                    row.appendChild(meta);
+                    row.appendChild(right);
+                    list.appendChild(row);
+                }});
+            }}
+
+            const excludedCount = allDevices.filter(d => d.excluded).length;
+            count.textContent = `${{filtered.length}} shown / ${{allDevices.length}} total (${{excludedCount}} excluded)`;
+        }}
+
+        async function toggleDeviceExcluded(entityId, excluded) {{
+            const currentExcluded = new Set(
+                allDevices
+                    .filter(device => device.excluded)
+                    .map(device => device.entity_id)
+            );
+            if (excluded) {{
+                currentExcluded.add(entityId);
+            }} else {{
+                currentExcluded.delete(entityId);
+            }}
+
+            try {{
+                const res = await fetch('/api/entities/exclusions', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{
+                        entity_ids: Array.from(currentExcluded)
+                    }})
+                }});
+                const data = await res.json();
+                const excludedSet = new Set(data.excluded_entities || []);
+                allDevices = allDevices.map(device => ({{
+                    ...device,
+                    excluded: excludedSet.has(device.entity_id)
+                }}));
+                renderDeviceList();
+            }} catch (e) {{
+                console.error('Failed to update exclusions:', e);
+                loadDevices();
+            }}
+        }}
+
+        async function syncDevices() {{
+            const count = document.getElementById('device-count');
+            if (count) count.textContent = 'Syncing...';
+            try {{
+                await fetch('/api/entities/refresh', {{ method: 'POST' }});
+            }} catch (e) {{
+                console.error('Device sync failed:', e);
+            }}
+            await loadDevices();
+            setTimeout(syncDeviceListHeight, 100);
         }}
 
         async function clearLogs() {{
@@ -2053,9 +2257,10 @@ ${{JSON.stringify(log.response_data, null, 2)}}
                 const actionsHeight = actionsCard.offsetHeight;
                 // Get the devices card header height (title + count)
                 const headerHeight = devicesCard.querySelector('.status-header')?.offsetHeight || 0;
-                // Calculate available height for device list (card padding is 20px top + 20px bottom)
-                const availableHeight = actionsHeight - headerHeight - 40;
-                deviceList.style.maxHeight = Math.max(200, availableHeight) + 'px';
+                const controlsHeight = devicesCard.querySelector('.device-controls')?.offsetHeight || 0;
+                // Calculate available height for device list (includes card padding and control spacing)
+                const availableHeight = actionsHeight - headerHeight - controlsHeight - 48;
+                deviceList.style.maxHeight = Math.max(300, availableHeight) + 'px';
             }}
         }}
 
@@ -2093,6 +2298,409 @@ async def chat_endpoint(request: ChatRequest):
             success=False,
             session_id=request.session_id
         )
+
+
+@app.get("/devices-manager", response_class=HTMLResponse)
+async def devices_manager_page():
+    """Dedicated device manager page (simpler than modal for reliability)."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Manage Devices</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --font-primary: 'Outfit', system-ui, -apple-system, sans-serif;
+            --font-secondary: 'DM Sans', system-ui, -apple-system, sans-serif;
+            --background: #fdfbf7;
+            --foreground: #4a4137;
+            --muted: #f5f2ed;
+            --muted-foreground: #8a8378;
+            --card: #ffffff;
+            --border: #e8e4dc;
+            --primary: #ff9b85;
+            --primary-dark: #f48171;
+            --shadow-sm: 0 2px 4px 0 rgb(0 0 0 / 0.04);
+            --shadow-md: 0 4px 12px 0 rgb(0 0 0 / 0.05);
+            --radius-md: 0.75rem;
+            --radius-lg: 1rem;
+            --radius-xl: 1.25rem;
+        }
+        body {
+            margin: 0;
+            font-family: var(--font-secondary);
+            background: linear-gradient(135deg, #fff8f5 0%, #fdfbf7 30%, #f8f4ef 100%);
+            color: var(--foreground);
+        }
+        .wrap {
+            max-width: 1200px;
+            margin: 20px auto 28px auto;
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-md);
+            overflow: hidden;
+        }
+        .head {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 18px 20px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(135deg, rgba(255, 155, 133, 0.08) 0%, rgba(212, 197, 249, 0.1) 100%);
+        }
+        .toolbar {
+            display: grid;
+            grid-template-columns: 1fr auto auto auto auto;
+            gap: 10px;
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--border);
+            background: var(--muted);
+        }
+        input[type="text"], select {
+            padding: 9px 11px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--card);
+            color: var(--foreground);
+            font-family: var(--font-secondary);
+            font-size: 0.9rem;
+            width: 100%;
+        }
+        button {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            background: var(--card);
+            color: var(--foreground);
+            font-family: var(--font-secondary);
+            font-weight: 500;
+            cursor: pointer;
+            box-shadow: var(--shadow-sm);
+            transition: transform 0.15s ease, border-color 0.15s ease;
+        }
+        button:hover {
+            transform: translateY(-1px);
+            border-color: var(--primary);
+        }
+        .content {
+            max-height: calc(100vh - 210px);
+            overflow-y: auto;
+            padding: 14px 20px 18px 20px;
+        }
+        details {
+            border: 1px solid var(--border);
+            border-radius: var(--radius-lg);
+            margin-bottom: 8px;
+            background: var(--card);
+            box-shadow: var(--shadow-sm);
+        }
+        summary {
+            cursor: pointer;
+            padding: 11px 12px;
+            font-weight: 600;
+            font-family: var(--font-primary);
+        }
+        .rows {
+            padding: 8px;
+            border-top: 1px solid var(--border);
+            background: var(--muted);
+        }
+        .group-actions {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            margin-bottom: 8px;
+        }
+        .group-actions button {
+            padding: 6px 10px;
+            font-size: 12px;
+        }
+        .row {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 120px 120px;
+            gap: 8px;
+            align-items: center;
+            padding: 8px;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            margin-bottom: 6px;
+            background: var(--card);
+        }
+        .meta {
+            min-width: 0;
+        }
+        .name {
+            font-size: 14px;
+            font-weight: 600;
+            font-family: var(--font-primary);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .sub {
+            font-size: 12px;
+            color: var(--muted-foreground);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .state {
+            font-size: 12px;
+            color: var(--muted-foreground);
+            background: var(--muted);
+            padding: 6px 8px;
+            border-radius: 999px;
+            text-align: center;
+        }
+        .empty {
+            padding: 14px;
+            border: 1px dashed var(--border);
+            border-radius: var(--radius-md);
+            color: var(--muted-foreground);
+            text-align: center;
+            background: var(--muted);
+        }
+        .back-link {
+            text-decoration: none;
+        }
+        .back-btn {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: #fff;
+            border-color: transparent;
+        }
+        .toolbar label {
+            display:flex;
+            align-items:center;
+            gap:6px;
+            font-size:14px;
+            color: var(--muted-foreground);
+        }
+        #count {
+            display:flex;
+            align-items:center;
+            font-size:13px;
+            color: var(--muted-foreground);
+            background: var(--card);
+            border: 1px solid var(--border);
+            padding: 0 10px;
+            border-radius: 999px;
+        }
+        @media (max-width: 900px) {
+            .toolbar { grid-template-columns: 1fr; }
+            .row { grid-template-columns: 1fr; }
+            .group-actions { justify-content: flex-start; }
+        }
+    </style>
+</head>
+<body>
+    <div class="wrap">
+        <div class="head">
+            <h2 style="margin:0; font-family: var(--font-primary);">Manage Devices</h2>
+            <a href="/" class="back-link"><button class="back-btn">Back</button></a>
+        </div>
+        <div class="toolbar">
+            <input type="text" id="search" placeholder="Search by device, entity, domain, or state" />
+            <select id="viewMode">
+                <option value="device">Device view</option>
+                <option value="domain">Domain view</option>
+            </select>
+            <label><input id="showExcluded" type="checkbox" /> Show excluded</label>
+            <button onclick="syncNow()">Sync Now</button>
+            <div id="count">Loading...</div>
+        </div>
+        <div class="content" id="list"><div class="empty">Loading devices...</div></div>
+    </div>
+
+    <script>
+        let allDevices = [];
+
+        function groupDevices(devices) {
+            const mode = document.getElementById('viewMode').value || 'device';
+            const groups = new Map();
+            for (const device of devices) {
+                let key;
+                let label;
+                if (mode === 'domain') {
+                    key = 'domain-' + (device.domain || 'unknown');
+                    label = (device.domain || 'unknown');
+                } else {
+                    label = device.device_group || device.friendly_name || device.entity_id || 'Unnamed Device';
+                    key = device.device_group_key || label.toLowerCase().trim();
+                }
+                if (!groups.has(key)) groups.set(key, { key, label, items: [] });
+                groups.get(key).items.push(device);
+            }
+            return Array.from(groups.values()).sort((a, b) => a.label.localeCompare(b.label));
+        }
+
+        function getFilteredDevices() {
+            const q = (document.getElementById('search').value || '').toLowerCase().trim();
+            const showExcluded = document.getElementById('showExcluded').checked;
+            return allDevices.filter(d => {
+                if (!showExcluded && d.excluded) return false;
+                if (!q) return true;
+                const hay = [(d.device_group || ''), (d.friendly_name || ''), (d.entity_id || ''), (d.domain || ''), (d.state || '')].join(' ').toLowerCase();
+                return hay.includes(q);
+            });
+        }
+
+        function render() {
+            const list = document.getElementById('list');
+            const filtered = getFilteredDevices();
+            const groups = groupDevices(filtered);
+            const excludedCount = allDevices.filter(d => d.excluded).length;
+            document.getElementById('count').textContent = `${filtered.length} shown / ${allDevices.length} total (${excludedCount} excluded)`;
+
+            if (!groups.length) {
+                list.innerHTML = '<div class="empty">No devices match your filters.</div>';
+                return;
+            }
+
+            list.innerHTML = '';
+            for (const group of groups) {
+                const details = document.createElement('details');
+                details.open = true;
+                const summary = document.createElement('summary');
+                const excludedInGroup = group.items.filter(i => i.excluded).length;
+                summary.textContent = `${group.label} (${group.items.length} entities, ${excludedInGroup} excluded)`;
+                details.appendChild(summary);
+
+                const rows = document.createElement('div');
+                rows.className = 'rows';
+
+                const actions = document.createElement('div');
+                actions.className = 'group-actions';
+                const includeAllBtn = document.createElement('button');
+                includeAllBtn.textContent = 'Include all';
+                includeAllBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setGroupExcluded(group.items, false);
+                };
+                const excludeAllBtn = document.createElement('button');
+                excludeAllBtn.textContent = 'Exclude all';
+                excludeAllBtn.onclick = (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setGroupExcluded(group.items, true);
+                };
+                actions.appendChild(includeAllBtn);
+                actions.appendChild(excludeAllBtn);
+                rows.appendChild(actions);
+
+                for (const item of group.items) {
+                    const row = document.createElement('div');
+                    row.className = 'row';
+
+                    const meta = document.createElement('div');
+                    meta.className = 'meta';
+                    const name = document.createElement('div');
+                    name.className = 'name';
+                    name.textContent = item.friendly_name || item.entity_id || 'Unnamed Entity';
+                    const sub = document.createElement('div');
+                    sub.className = 'sub';
+                    sub.textContent = `${item.domain || 'unknown'} - ${item.entity_id || 'unknown'}`;
+                    meta.appendChild(name);
+                    meta.appendChild(sub);
+
+                    const state = document.createElement('div');
+                    state.className = 'state';
+                    state.textContent = item.state || 'unknown';
+
+                    const label = document.createElement('label');
+                    label.style.display = 'inline-flex';
+                    label.style.alignItems = 'center';
+                    label.style.gap = '6px';
+                    label.style.fontSize = '13px';
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.checked = !!item.excluded;
+                    checkbox.onchange = () => updateExcluded(item.entity_id, checkbox.checked);
+                    const txt = document.createElement('span');
+                    txt.textContent = 'Excluded';
+                    label.appendChild(checkbox);
+                    label.appendChild(txt);
+
+                    row.appendChild(meta);
+                    row.appendChild(state);
+                    row.appendChild(label);
+                    rows.appendChild(row);
+                }
+
+                details.appendChild(rows);
+                list.appendChild(details);
+            }
+        }
+
+        async function persistExcludedSet(excludedSet) {
+            const res = await fetch('/api/entities/exclusions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ entity_ids: Array.from(excludedSet) })
+            });
+            const data = await res.json();
+            const updated = new Set(data.excluded_entities || []);
+            allDevices = allDevices.map(d => ({ ...d, excluded: updated.has(d.entity_id) }));
+            render();
+        }
+
+        async function load() {
+            const list = document.getElementById('list');
+            list.innerHTML = '<div class="empty">Loading devices...</div>';
+            try {
+                const res = await fetch('/api/ui/devices');
+                const data = await res.json();
+                allDevices = data.devices || [];
+                render();
+            } catch (e) {
+                list.innerHTML = '<div class="empty">Could not load devices.</div>';
+            }
+        }
+
+        async function updateExcluded(entityId, excluded) {
+            const excludedSet = new Set(allDevices.filter(d => d.excluded).map(d => d.entity_id));
+            if (excluded) excludedSet.add(entityId);
+            else excludedSet.delete(entityId);
+            try {
+                await persistExcludedSet(excludedSet);
+            } catch (e) {
+                await load();
+            }
+        }
+
+        async function setGroupExcluded(groupItems, excluded) {
+            const excludedSet = new Set(allDevices.filter(d => d.excluded).map(d => d.entity_id));
+            for (const item of groupItems) {
+                if (excluded) excludedSet.add(item.entity_id);
+                else excludedSet.delete(item.entity_id);
+            }
+            try {
+                await persistExcludedSet(excludedSet);
+            } catch (e) {
+                await load();
+            }
+        }
+
+        async function syncNow() {
+            document.getElementById('count').textContent = 'Syncing...';
+            try { await fetch('/api/entities/refresh', { method: 'POST' }); } catch (e) {}
+            await load();
+        }
+
+        document.getElementById('search').addEventListener('input', render);
+        document.getElementById('showExcluded').addEventListener('change', render);
+        document.getElementById('viewMode').addEventListener('change', render);
+        load();
+    </script>
+</body>
+</html>
+    """
 
 
 @app.get("/api/usage")
@@ -2142,21 +2750,26 @@ async def clear_session(session_id: str):
 @app.get("/api/entities")
 async def get_entities():
     """Get cached entity index info."""
+    from app.entity_filters import get_excluded_entity_patterns
     from app.setup.entity_cache import get_entity_cache
+
     cache = get_entity_cache()
     index = cache.load()
+    excluded = get_excluded_entity_patterns()
 
     if not index:
         return {
             "cached": False,
             "entity_count": 0,
             "last_refreshed": None,
+            "excluded_count": len(excluded),
             "message": "No entity cache. Validate Home Assistant connection to populate."
         }
 
     return {
         "cached": True,
         "entity_count": index.entity_count,
+        "excluded_count": len(excluded),
         "last_refreshed": index.last_refreshed,
         "ha_url": index.ha_url
     }
@@ -2165,40 +2778,189 @@ async def get_entities():
 @app.get("/api/ui/devices")
 async def get_ui_devices():
     """Get all cached devices with current state for the UI."""
+    from app.config import get_settings
+    from app.entity_filters import get_excluded_entity_patterns, is_entity_excluded
     from app.setup.entity_cache import get_entity_cache
     from app.tools.home_assistant import HomeAssistantClient
 
+    settings = get_settings()
+    excluded_patterns = get_excluded_entity_patterns()
+    entity_to_device_id: dict[str, str] = {}
+    device_id_to_name: dict[str, str] = {}
+    if settings.ha_url and settings.ha_token:
+        try:
+            entity_to_device_id, device_id_to_name = await _fetch_ha_registry_maps(
+                settings.ha_url,
+                settings.ha_token,
+            )
+        except Exception:
+            entity_to_device_id, device_id_to_name = {}, {}
+
     cache = get_entity_cache()
     index = cache.load()
-    if not index:
-        return {
-            "cached": False,
-            "last_refreshed": None,
-            "devices": []
-        }
+    by_entity_id = {}
+    if index:
+        for entity in index.entities:
+            by_entity_id[entity.entity_id] = {
+                "entity_id": entity.entity_id,
+                "domain": entity.domain,
+                "friendly_name": entity.friendly_name,
+                "device_class": entity.device_class,
+                "state": "unknown",
+                "device_name": None,
+                "device_registry_id": entity_to_device_id.get(entity.entity_id),
+            }
 
-    state_map = {}
+    has_live_states = False
     try:
-        client = HomeAssistantClient()
-        states = await client.get_states()
-        state_map = {s.entity_id: s.state for s in states}
+        if settings.ha_url and settings.ha_token:
+            client = HomeAssistantClient()
+            # Keep UI responsive: if live state fetch is slow, fall back to cached entities.
+            states = await asyncio.wait_for(
+                client.get_states(include_excluded=True),
+                timeout=4.0
+            )
+            has_live_states = True
+            for state in states:
+                entity_id = state.entity_id
+                domain = entity_id.split(".")[0] if "." in entity_id else "unknown"
+                existing = by_entity_id.get(entity_id, {})
+                by_entity_id[entity_id] = {
+                    "entity_id": entity_id,
+                    "domain": existing.get("domain") or domain,
+                    "friendly_name": (
+                        state.attributes.get("friendly_name")
+                        or existing.get("friendly_name")
+                        or entity_id
+                    ),
+                    "device_class": (
+                        state.attributes.get("device_class")
+                        or existing.get("device_class")
+                    ),
+                    "state": state.state,
+                    "device_name": (
+                        state.attributes.get("device_name")
+                        or existing.get("device_name")
+                        or (
+                            device_id_to_name.get(entity_to_device_id.get(entity_id, ""))
+                            if entity_to_device_id.get(entity_id)
+                            else None
+                        )
+                    ),
+                    "device_registry_id": (
+                        entity_to_device_id.get(entity_id)
+                        or existing.get("device_registry_id")
+                    ),
+                }
     except Exception:
-        state_map = {}
+        has_live_states = False
 
     devices = []
-    for entity in index.entities:
+    grouped_entity_counts: dict[str, int] = defaultdict(int)
+    for entity in by_entity_id.values():
+        entity_id = entity["entity_id"]
+        registry_device_id = entity.get("device_registry_id")
+        if registry_device_id:
+            group_key = f"device-{registry_device_id}"
+            group_label = (
+                device_id_to_name.get(registry_device_id)
+                or entity.get("device_name")
+                or entity.get("friendly_name")
+                or entity_id
+            )
+        else:
+            # Entity is not linked to a device in HA registry.
+            group_key = f"unassigned-{entity_id.replace('.', '-')}"
+            group_label = f"Unassigned: {entity.get('friendly_name') or entity_id}"
+        grouped_entity_counts[group_key] += 1
         devices.append({
-            "entity_id": entity.entity_id,
-            "domain": entity.domain,
-            "friendly_name": entity.friendly_name,
-            "device_class": entity.device_class,
-            "state": state_map.get(entity.entity_id, "unknown")
+            **entity,
+            "device_group": group_label,
+            "device_group_key": group_key,
+            "excluded": is_entity_excluded(entity["entity_id"], excluded_patterns),
         })
+    devices.sort(
+        key=lambda d: (
+            d["excluded"],
+            d.get("domain", ""),
+            (d.get("friendly_name") or d.get("entity_id") or "").lower(),
+        )
+    )
 
     return {
-        "cached": True,
-        "last_refreshed": index.last_refreshed,
-        "devices": devices
+        "cached": bool(index),
+        "live_states": has_live_states,
+        "registry_mapped": bool(entity_to_device_id),
+        "last_refreshed": index.last_refreshed if index else None,
+        "devices": devices,
+        "excluded_count": sum(1 for d in devices if d["excluded"]),
+        "group_count": len(grouped_entity_counts),
+    }
+
+
+@app.get("/api/entities/exclusions")
+async def get_entity_exclusions():
+    """Get the currently configured excluded entities."""
+    from app.entity_filters import get_excluded_entity_patterns
+
+    excluded = get_excluded_entity_patterns()
+    return {
+        "excluded_entities": excluded,
+        "count": len(excluded),
+    }
+
+
+@app.post("/api/entities/exclusions")
+async def update_entity_exclusions(request: ExcludedEntitiesRequest):
+    """Persist excluded entities and refresh caches."""
+    from app.config import clear_settings_cache
+    from app.setup.entity_cache import get_entity_cache
+    from app.setup.models import StoredConfig
+    from app.setup.storage import ConfigStorage
+
+    normalized = sorted({
+        entity_id.strip().lower()
+        for entity_id in (request.entity_ids or [])
+        if isinstance(entity_id, str) and entity_id.strip()
+    })
+
+    storage = ConfigStorage()
+    existing_config = storage.load()
+    if not existing_config:
+        return {
+            "success": False,
+            "error": "No configuration found. Complete setup first.",
+            "excluded_entities": [],
+        }
+
+    updated_config = StoredConfig(
+        provider=existing_config.provider,
+        limits=existing_config.limits,
+        home_assistant=existing_config.home_assistant,
+        app_name=existing_config.app_name,
+        excluded_entities=",".join(normalized),
+    )
+    storage.save(updated_config)
+
+    clear_settings_cache()
+    clear_agent_cache()
+
+    cache = get_entity_cache()
+    cache.clear_memory_cache()
+    if (
+        existing_config.home_assistant.url
+        and existing_config.home_assistant.token
+    ):
+        await cache.fetch_and_cache(
+            existing_config.home_assistant.url,
+            existing_config.home_assistant.token,
+            background=True,
+        )
+
+    return {
+        "success": True,
+        "excluded_entities": normalized,
+        "count": len(normalized),
     }
 
 
@@ -2775,3 +3537,4 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

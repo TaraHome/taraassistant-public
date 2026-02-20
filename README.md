@@ -96,6 +96,9 @@ This component listens to Home Assistant events and service calls. It records th
 
 Data is stored locally under the data volume. No external telemetry, no silent uploads.
 
+If you want Tara to ignore specific entities entirely, set `EXCLUDED_ENTITIES` (comma or newline
+separated, wildcard supported like `camera.*`).
+
 ### Pattern Detector
 
 This is where the learning happens. The detector scans the event history for routines that look intentional rather than random. Examples include:
