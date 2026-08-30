@@ -137,8 +137,13 @@ class PatternScheduler:
     async def _run_cleanup(self) -> int:
         """Execute cleanup of old events."""
         try:
+            from app.config import get_settings
             db = get_pattern_db()
-            deleted = db.cleanup_old_events(days=30)
+            cleanup_retention_days = get_settings().cleanup_retention_days
+            if cleanup_retention_days <= 0:
+                logger.debug("Cleanup retention is 0 (never delete); skipping cleanup")
+                return 0
+            deleted = db.cleanup_old_events(days=cleanup_retention_days)
             if deleted > 0:
                 logger.info(f"Cleaned up {deleted} old events")
             return deleted

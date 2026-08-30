@@ -1312,7 +1312,8 @@ async def home():
                     <div class="status-header">
                         <h3 class="section-title">Usage Insights</h3>
                         <div style="display: flex; gap: 8px; align-items: center;">
-                            <button class="header-btn" onclick="syncPatterns()" style="padding: 6px 12px; font-size: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); cursor: pointer;">Sync Now</button>
+                            <button id="sync-now-btn" class="header-btn" onclick="syncPatterns()" style="padding: 6px 12px; font-size: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); cursor: pointer;">Sync Now</button>
+                            <button id="backfill-btn" class="header-btn" onclick="backfillPatterns()" style="padding: 6px 12px; font-size: 0.75rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--card); cursor: pointer;">Backfill</button>
                             <span id="insights-sync-status" class="status-count">Not synced</span>
                         </div>
                     </div>
@@ -1823,7 +1824,11 @@ async def home():
 
         async function syncPatterns() {{
             const statusEl = document.getElementById('insights-sync-status');
+            const syncBtn = document.getElementById('sync-now-btn');
+            const backfillBtn = document.getElementById('backfill-btn');
             if (statusEl) statusEl.textContent = 'Syncing...';
+            if (syncBtn) syncBtn.disabled = true;
+            if (backfillBtn) backfillBtn.disabled = true;
 
             try {{
                 await fetch('/api/patterns/sync', {{ method: 'POST' }});
@@ -1834,6 +1839,38 @@ async def home():
             }} catch (e) {{
                 console.error('Sync failed:', e);
                 if (statusEl) statusEl.textContent = 'Sync failed';
+            }} finally {{
+                if (syncBtn) syncBtn.disabled = false;
+                if (backfillBtn) backfillBtn.disabled = false;
+            }}
+        }}
+
+        async function backfillPatterns() {{
+            const statusEl = document.getElementById('insights-sync-status');
+            const syncBtn = document.getElementById('sync-now-btn');
+            const backfillBtn = document.getElementById('backfill-btn');
+            if (statusEl) statusEl.textContent = 'Backfilling...';
+            if (syncBtn) syncBtn.disabled = true;
+            if (backfillBtn) backfillBtn.disabled = true;
+
+            try {{
+                const syncRes = await fetch('/api/patterns/sync?full=true', {{ method: 'POST' }});
+                const syncData = await syncRes.json();
+                if (!syncData.success) {{
+                    console.error('Backfill failed:', syncData.error);
+                    if (statusEl) statusEl.textContent = 'Backfill failed';
+                    return;
+                }}
+                await fetch('/api/patterns/detect', {{ method: 'POST' }});
+                await loadPatterns();
+                await loadBehaviorSuggestions();
+                if (statusEl) statusEl.textContent = 'Just now';
+            }} catch (e) {{
+                console.error('Backfill failed:', e);
+                if (statusEl) statusEl.textContent = 'Backfill failed';
+            }} finally {{
+                if (syncBtn) syncBtn.disabled = false;
+                if (backfillBtn) backfillBtn.disabled = false;
             }}
         }}
 
@@ -2662,7 +2699,7 @@ async def get_pattern_suggestions():
 
 
 @app.post("/api/patterns/sync")
-async def trigger_pattern_sync():
+async def trigger_pattern_sync(full: bool = False):
     """Manually trigger a sync from Home Assistant history."""
     try:
         from app.patterns.collector import EventCollector
@@ -2673,7 +2710,7 @@ async def trigger_pattern_sync():
             return {"success": False, "error": "Home Assistant not configured", "events_synced": 0}
 
         collector = EventCollector(settings.ha_url, settings.ha_token)
-        count, error = await collector.sync_from_history_api()
+        count, error = await collector.sync_from_history_api(force_full=full)
 
         if error:
             return {"success": False, "error": error, "events_synced": 0}
