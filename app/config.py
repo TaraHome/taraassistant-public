@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # Home Assistant
     ha_url: str = Field(default="http://localhost:8123")
     ha_token: str = Field(default="")
+    # Days of HA history to pull on the first sync. The first sync pulls 7 days
+    # by default (opt into more via setup or settings); <=0 still means
+    # all-available capped at ~10 years (the History API needs a start bound).
+    history_backfill_days: int = Field(default=7)
+    # Days of collected events to keep; 0 = never delete.
+    cleanup_retention_days: int = Field(default=30)
 
     # Rate limiting
     max_tokens_per_response: int = Field(default=4096)
@@ -94,6 +100,10 @@ def get_settings() -> Settings:
                 "max_tokens_per_response": stored_config.limits.max_tokens_per_response,
                 "requests_per_minute": stored_config.limits.requests_per_minute,
                 "guardrails_threshold": getattr(stored_config.limits, 'guardrails_threshold', 70),
+                "history_backfill_days": getattr(stored_config.limits, 'history_backfill_days', 7),
+                "cleanup_retention_days": getattr(
+                    stored_config.limits, 'cleanup_retention_days', 30
+                ),
                 "ha_url": stored_config.home_assistant.url,
                 "ha_token": stored_config.home_assistant.token,
             }

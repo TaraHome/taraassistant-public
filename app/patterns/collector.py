@@ -7,6 +7,7 @@ from typing import Optional
 
 import httpx
 
+from app.config import get_settings
 from app.patterns.database import get_pattern_db
 from app.patterns.models import DeviceEvent, EventSource
 
@@ -32,6 +33,8 @@ class EventCollector:
         "vacuum",
         "humidifier",
     }
+
+    HISTORY_CHUNK_DAYS = 7
 
     def __init__(self, ha_url: str, ha_token: str):
         self.ha_url = ha_url.rstrip("/")
@@ -92,6 +95,7 @@ class EventCollector:
         self,
         hours_back: int = 24,
         entity_ids: Optional[list[str]] = None,
+        force_full: bool = False,
     ) -> tuple[int, Optional[str]]:
         """
         Fetch state changes from Home Assistant History API.
@@ -101,15 +105,15 @@ class EventCollector:
         start_time = time.time()
 
         # Determine start timestamp - use last sync or fall back to hours_back
-        last_sync = self.db.get_last_sync_timestamp()
+        last_sync = None if force_full else self.db.get_last_sync_timestamp()
         if last_sync:
             # Add small overlap to avoid missing events
             start_ts = last_sync - timedelta(minutes=5)
         else:
-            # First sync: fetch 7 days of history for better pattern detection
-            # Pattern detection needs multiple occurrences across different days
-            start_ts = datetime.utcnow() - timedelta(days=7)
-            logger.info("First sync: fetching 7 days of history for pattern detection")
+            backfill_days = get_settings().history_backfill_days
+            days = 3650 if backfill_days <= 0 else backfill_days
+            start_ts = datetime.utcnow() - timedelta(days=days)
+            logger.info(f"First sync: fetching {days} days of history for pattern detection")
 
         end_ts = datetime.utcnow()
 
@@ -124,29 +128,22 @@ class EventCollector:
                         self.db.update_sync_metadata(end_ts, 0, duration_ms)
                         return 0, None
 
-                # Home Assistant History API endpoint
-                # https://developers.home-assistant.io/docs/api/rest/#get-apihistoryperiodtimestamp
-                url = f"{self.ha_url}/api/history/period/{start_ts.isoformat()}"
-                params = {
-                    "end_time": end_ts.isoformat(),
-                    "minimal_response": "true",
-                    "significant_changes_only": "true",
-                    "filter_entity_id": ",".join(entity_ids),
-                }
+                events = []
+                current_start = start_ts
+                while current_start < end_ts:
+                    current_end = min(
+                        end_ts,
+                        current_start + timedelta(days=self.HISTORY_CHUNK_DAYS),
+                    )
 
-                response = await client.get(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {self.ha_token}",
-                        "Content-Type": "application/json",
-                    },
-                    params=params,
-                )
-                response.raise_for_status()
-                history_data = response.json()
+                    history_data = await self._fetch_history_chunk(
+                        client, entity_ids, current_start, current_end
+                    )
 
-            # Parse and filter events
-            events = self._parse_history_data(history_data)
+                    chunk_events = self._parse_history_data(history_data)
+                    events.extend(chunk_events)
+
+                    current_start = current_end
 
             # Deduplicate against existing events
             events = self._deduplicate_events(events)
@@ -174,6 +171,32 @@ class EventCollector:
             self.db.update_sync_metadata(datetime.utcnow(), 0, duration_ms, error_msg)
             return 0, error_msg
 
+    async def _fetch_history_chunk(
+        self,
+        client: httpx.AsyncClient,
+        entity_ids: list[str],
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> list:
+        """Fetch a chunk of history from Home Assistant."""
+        url = f"{self.ha_url}/api/history/period/{chunk_start.isoformat()}"
+        params = {
+            "end_time": chunk_end.isoformat(),
+            "minimal_response": "true",
+            "significant_changes_only": "true",
+            "filter_entity_id": ",".join(entity_ids),
+        }
+        response = await client.get(
+            url,
+            headers={
+                "Authorization": f"Bearer {self.ha_token}",
+                "Content-Type": "application/json",
+            },
+            params=params,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def _parse_history_data(self, history_data: list) -> list[DeviceEvent]:
         """Parse Home Assistant history API response into DeviceEvents."""
         events = []
@@ -196,10 +219,16 @@ class EventCollector:
             # Process state changes
             prev_state = None
             for state_obj in entity_history:
-                current_state = state_obj.get("state", "")
+                current_state = state_obj.get("state")
 
-                # Skip unavailable/unknown states
-                if current_state in ("unavailable", "unknown", ""):
+                # Skip non-string/None or unavailable/unknown states. HA's history API can return
+                # entries with a null state (e.g. some switch/container entities); these are not
+                # real transitions and would fail DeviceEvent validation, aborting the whole sync.
+                if not isinstance(current_state, str) or current_state in (
+                    "unavailable",
+                    "unknown",
+                    "",
+                ):
                     continue
 
                 timestamp_str = state_obj.get("last_changed", "")
@@ -281,12 +310,12 @@ class EventCollector:
         }
 
         # Filter out duplicates
-        unique_events = [
-            e
-            for e in events
-            if (e.entity_id, e.timestamp.isoformat()[:19], e.new_state)
-            not in existing_keys
-        ]
+        unique_events = []
+        for e in events:
+            key = (e.entity_id, e.timestamp.isoformat()[:19], e.new_state)
+            if key not in existing_keys:
+                unique_events.append(e)
+                existing_keys.add(key)
 
         if len(unique_events) < len(events):
             logger.debug(

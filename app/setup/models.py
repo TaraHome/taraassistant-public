@@ -48,6 +48,8 @@ class LimitsConfig(BaseModel):
     max_tokens_per_response: int = Field(default=4096, ge=100, le=32000)
     requests_per_minute: int = Field(default=20, ge=1, le=100)
     guardrails_threshold: int = Field(default=70, ge=0, le=100)  # 0 = disabled
+    history_backfill_days: int = Field(default=7, ge=0, le=3650)  # 0 = all available (~10y cap)
+    cleanup_retention_days: int = Field(default=30, ge=0, le=3650)  # 0 = never delete
 
 
 class HomeAssistantConfig(BaseModel):

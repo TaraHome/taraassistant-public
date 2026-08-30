@@ -17,6 +17,8 @@ def get_limits_html(existing_config: StoredConfig) -> str:
     prefill_max_tokens = existing_config.limits.max_tokens_per_response
     prefill_rpm = existing_config.limits.requests_per_minute
     prefill_guardrails = getattr(existing_config.limits, 'guardrails_threshold', 70)
+    prefill_backfill = getattr(existing_config.limits, 'history_backfill_days', 7)
+    prefill_cleanup = getattr(existing_config.limits, 'cleanup_retention_days', 30)
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -438,6 +440,38 @@ def get_limits_html(existing_config: StoredConfig) -> str:
             </div>
         </div>
 
+        <!-- Pattern Learning -->
+        <div class="card">
+            <h2><span class="card-icon tokens">&#x1F9E0;</span> Pattern Learning</h2>
+            <p class="card-description">
+                Configure how TaraAssistant syncs and retains Home Assistant history for pattern detection.
+            </p>
+
+            <div class="slider-group">
+                <div class="slider-header">
+                    <label>History Backfill (Days)</label>
+                </div>
+                <input type="number" id="history-backfill-days" min="0" max="3650" step="1" value="{prefill_backfill}" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-background); color: var(--foreground); margin-bottom: 8px;">
+                <p class="slider-hint">
+                    How far back the first sync pulls Home Assistant history. 0 = as far back as available (up to ~10 years). Actual reach is limited by your HA recorder retention (purge_keep_days).
+                </p>
+            </div>
+
+            <div class="slider-group" style="margin-top: 24px;">
+                <div class="slider-header">
+                    <label>Cleanup Retention (Days)</label>
+                </div>
+                <input type="number" id="cleanup-retention-days" min="0" max="3650" step="1" value="{prefill_cleanup}" style="width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--input-background); color: var(--foreground); margin-bottom: 8px;">
+                <p class="slider-hint">
+                    How many days of collected events to keep. 0 = never delete. Set this &gt;= the backfill window, or backfilled history will be pruned.
+                </p>
+            </div>
+
+            <button class="btn btn-secondary" onclick="saveAndBackfill()" id="backfill-now-btn" style="margin-top: 16px; width: 100%;">
+                Save &amp; Backfill Now
+            </button>
+        </div>
+
         <div id="save-status" class="status-message"></div>
 
         <button class="btn btn-primary" onclick="saveLimits()" id="save-btn">
@@ -483,6 +517,18 @@ def get_limits_html(existing_config: StoredConfig) -> str:
             }}
         }}
 
+        function buildLimitsPayload() {{
+            return {{
+                limits: {{
+                    max_tokens_per_response: parseInt(document.getElementById('max-tokens').value),
+                    requests_per_minute: parseInt(document.getElementById('requests-per-minute').value),
+                    guardrails_threshold: parseInt(document.getElementById('guardrails-threshold').value),
+                    history_backfill_days: parseInt(document.getElementById('history-backfill-days').value),
+                    cleanup_retention_days: parseInt(document.getElementById('cleanup-retention-days').value)
+                }}
+            }};
+        }}
+
         async function saveLimits() {{
             const btn = document.getElementById('save-btn');
             const status = document.getElementById('save-status');
@@ -490,13 +536,7 @@ def get_limits_html(existing_config: StoredConfig) -> str:
             btn.innerHTML = '<span class="loading"></span>Saving...';
             btn.disabled = true;
 
-            const limits = {{
-                limits: {{
-                    max_tokens_per_response: parseInt(document.getElementById('max-tokens').value),
-                    requests_per_minute: parseInt(document.getElementById('requests-per-minute').value),
-                    guardrails_threshold: parseInt(document.getElementById('guardrails-threshold').value)
-                }}
-            }};
+            const limits = buildLimitsPayload();
 
             try {{
                 const res = await fetch('/api/setup/save-limits', {{
@@ -522,6 +562,50 @@ def get_limits_html(existing_config: StoredConfig) -> str:
                 status.className = 'status-message error';
                 status.textContent = 'Error saving settings. Please try again.';
                 btn.innerHTML = 'Save Changes';
+                btn.disabled = false;
+            }}
+        }}
+
+        async function saveAndBackfill() {{
+            const btn = document.getElementById('backfill-now-btn');
+            const status = document.getElementById('save-status');
+
+            btn.innerHTML = '<span class="loading"></span>Backfilling...';
+            btn.disabled = true;
+
+            const limits = buildLimitsPayload();
+
+            try {{
+                const saveRes = await fetch('/api/setup/save-limits', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify(limits)
+                }});
+
+                const saveData = await saveRes.json();
+                if (!saveData.success) {{
+                    status.className = 'status-message error';
+                    status.textContent = saveData.detail || 'Failed to save settings before backfill';
+                    btn.innerHTML = 'Save &amp; Backfill Now';
+                    btn.disabled = false;
+                    return;
+                }}
+                
+                const syncRes = await fetch('/api/patterns/sync?full=true', {{ method: 'POST' }});
+                const syncData = await syncRes.json();
+                
+                if (syncData.success) {{
+                    status.className = 'status-message success';
+                    status.textContent = 'Backfilled ' + syncData.events_synced + ' events successfully!';
+                }} else {{
+                    status.className = 'status-message error';
+                    status.textContent = syncData.error || 'Failed to run backfill';
+                }}
+            }} catch (e) {{
+                status.className = 'status-message error';
+                status.textContent = 'Error during save and backfill. Please try again.';
+            }} finally {{
+                btn.innerHTML = 'Save &amp; Backfill Now';
                 btn.disabled = false;
             }}
         }}
@@ -576,6 +660,7 @@ def get_setup_html(existing_config: Optional[StoredConfig] = None) -> str:
     prefill_max_tokens = existing_config.limits.max_tokens_per_response if existing_config else 4096
     prefill_rpm = existing_config.limits.requests_per_minute if existing_config else 20
     prefill_guardrails = getattr(existing_config.limits, 'guardrails_threshold', 70) if existing_config else 70
+    prefill_backfill = getattr(existing_config.limits, 'history_backfill_days', 7) if existing_config else 7
     prefill_ha_url = existing_config.home_assistant.url if existing_config else ""
 
     return f'''<!DOCTYPE html>
@@ -1306,6 +1391,18 @@ def get_setup_html(existing_config: Optional[StoredConfig] = None) -> str:
                 </div>
             </div>
 
+            <!-- Pattern Learning -->
+            <div class="limit-section">
+                <h3 class="limit-title">Pattern Learning</h3>
+                <div class="form-group">
+                    <label for="history-backfill-days">Initial History Backfill (Days)</label>
+                    <input type="number" id="history-backfill-days" min="0" max="3650" step="1" value="{prefill_backfill}">
+                    <p class="slider-hint">
+                        How far back the first sync pulls Home Assistant history. Default 7 days. Increase for more history to learn from (0 = as far back as available; limited by your HA recorder retention).
+                    </p>
+                </div>
+            </div>
+
             <div class="btn-group">
                 <button class="btn btn-secondary" onclick="goToStep(2)">Back</button>
                 <button class="btn btn-primary" onclick="goToStep(4)">Next</button>
@@ -1634,7 +1731,8 @@ def get_setup_html(existing_config: Optional[StoredConfig] = None) -> str:
                 limits: {{
                     max_tokens_per_response: parseInt(document.getElementById('max-tokens').value),
                     requests_per_minute: parseInt(document.getElementById('requests-per-minute').value),
-                    guardrails_threshold: parseInt(document.getElementById('guardrails-threshold').value)
+                    guardrails_threshold: parseInt(document.getElementById('guardrails-threshold').value),
+                    history_backfill_days: parseInt(document.getElementById('history-backfill-days').value)
                 }},
                 home_assistant: {{
                     url: document.getElementById('ha-url').value,

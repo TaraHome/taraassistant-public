@@ -1150,6 +1150,240 @@ class TestIntegration(unittest.TestCase):
         self.assertGreater(len(suggestions), 0)
 
 
+class TestHistoryBackfill(unittest.TestCase):
+    """Tests for history backfill and chunking behavior."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db = self._get_test_db()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _get_test_db(self):
+        from app.patterns.database import PatternDatabase
+        db = PatternDatabase()
+        db.db_path = Path(self.temp_dir) / "test_patterns.db"
+        db._init_database()
+        return db
+
+    def test_config_default_read(self):
+        """history_backfill_days default is 7 and is read from Settings."""
+        from app.config import get_settings
+        settings = get_settings()
+        self.assertEqual(settings.history_backfill_days, 7)
+
+    @patch("app.patterns.collector.get_pattern_db")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    @patch("app.patterns.collector.EventCollector._get_tracked_entity_ids", new_callable=AsyncMock)
+    def test_small_incremental_span(self, mock_get_ids, mock_fetch, mock_get_db):
+        from app.patterns.collector import EventCollector
+        mock_get_ids.return_value = ["light.test"]
+        mock_fetch.return_value = []
+        mock_get_db.return_value = self.db
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        # Set last sync to 1 hour ago
+        now = datetime.utcnow()
+        self.db.update_sync_metadata(now - timedelta(hours=1), 0, 10)
+
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"]))
+
+        self.assertEqual(mock_fetch.call_count, 1)
+
+    @patch("app.patterns.collector.get_settings")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    def test_force_full_overrides_last_sync(self, mock_fetch, mock_settings):
+        from app.patterns.collector import EventCollector
+
+        mock_settings.return_value.history_backfill_days = 30
+        mock_fetch.return_value = []
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        # Set last sync to 1 hour ago
+        now = datetime.utcnow()
+        self.db.update_sync_metadata(now - timedelta(hours=1), 0, 10)
+
+        # Force full sync overrides recent last_sync
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"], force_full=True))
+        # 30 days / 7 days per chunk = 5 chunks
+        self.assertEqual(mock_fetch.call_count, 5)
+
+        mock_fetch.reset_mock()
+
+        # Normal sync uses recent last_sync
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"], force_full=False))
+        self.assertEqual(mock_fetch.call_count, 1)
+
+    @patch("app.patterns.collector.get_settings")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    def test_large_first_sync_chunked(self, mock_fetch, mock_settings):
+        from app.patterns.collector import EventCollector
+
+        mock_settings.return_value.history_backfill_days = 30
+
+        # Mock chunk responses to verify accumulation
+        ts_on = (datetime.utcnow() - timedelta(days=29)).isoformat() + "Z"
+        ts_off = (datetime.utcnow() - timedelta(days=22)).isoformat() + "Z"
+        mock_fetch.side_effect = [
+            [[{"entity_id": "light.test", "state": "on", "last_changed": ts_on}]],  # chunk 1
+            [[{"entity_id": "light.test", "state": "off", "last_changed": ts_off}]],  # chunk 2
+            [],  # chunk 3
+            [],  # chunk 4
+            [],  # chunk 5
+        ]
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"]))
+
+        # 30 days / 7 days per chunk = 5 chunks (ceil(30/7) = 5)
+        self.assertEqual(mock_fetch.call_count, 5)
+
+        # Events parsed from chunks should be accumulated
+        events = self.db.get_events_in_range(
+            datetime.utcnow() - timedelta(days=40), datetime.utcnow()
+        )
+        self.assertEqual(len(events), 2)
+
+    @patch("app.patterns.collector.get_settings")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    def test_zero_backfill_days_uses_cap(self, mock_fetch, mock_settings):
+        from app.patterns.collector import EventCollector
+
+        mock_settings.return_value.history_backfill_days = 0
+        mock_fetch.return_value = []
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"]))
+
+        # 3650 days / 7 = 522 chunks
+        self.assertEqual(mock_fetch.call_count, 522)
+
+        # Verify first call's start time is ~10 years ago
+        first_call_args = mock_fetch.call_args_list[0][0]
+        start_ts = first_call_args[2]
+        self.assertTrue((datetime.utcnow() - start_ts).days >= 3649)
+
+    @patch("app.patterns.collector.get_settings")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    def test_deduplication_across_chunks(self, mock_fetch, mock_settings):
+        from app.patterns.collector import EventCollector
+
+        mock_settings.return_value.history_backfill_days = 14
+
+        ts1 = (datetime.utcnow() - timedelta(days=10)).isoformat() + "Z"
+        # Duplicate event returned in multiple chunks
+        mock_fetch.side_effect = [
+            [[{"entity_id": "light.test", "state": "on", "last_changed": ts1}]],
+            [[{"entity_id": "light.test", "state": "on", "last_changed": ts1}]],
+            []
+        ]
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        asyncio.run(collector.sync_from_history_api(entity_ids=["light.test"]))
+
+        events = self.db.get_events_in_range(
+            datetime.utcnow() - timedelta(days=15), datetime.utcnow()
+        )
+        self.assertEqual(len(events), 1)
+
+    @patch("app.patterns.collector.get_settings")
+    @patch("app.patterns.collector.EventCollector._fetch_history_chunk", new_callable=AsyncMock)
+    def test_null_state_entries_skipped(self, mock_fetch, mock_settings):
+        """A null state after a real one must be skipped, not abort the whole sync.
+
+        HA's history API returns entries with `state: null` for some entities; before the
+        guard, such an entry (when it differed from the previous state) built a DeviceEvent
+        with new_state=None and raised a ValidationError that failed the entire sync.
+        """
+        from app.patterns.collector import EventCollector
+
+        mock_settings.return_value.history_backfill_days = 7
+
+        ts_ok = (datetime.utcnow() - timedelta(days=5)).isoformat() + "Z"
+        ts_null = (datetime.utcnow() - timedelta(days=4)).isoformat() + "Z"
+        # Same payload for every chunk (a real "on" transition followed by a null state).
+        # return_value (not side_effect) keeps the test robust to the exact chunk count.
+        mock_fetch.return_value = [[
+            {"entity_id": "switch.container", "state": "on", "last_changed": ts_ok},
+            {"entity_id": "switch.container", "state": None, "last_changed": ts_null},
+        ]]
+
+        collector = EventCollector("http://localhost:8123", "test_token")
+        collector.db = self.db
+
+        count, error = asyncio.run(
+            collector.sync_from_history_api(entity_ids=["switch.container"])
+        )
+
+        self.assertIsNone(error)  # null entry must not abort the sync
+        events = self.db.get_events_in_range(
+            datetime.utcnow() - timedelta(days=10), datetime.utcnow()
+        )
+        self.assertEqual(len(events), 1)  # only the valid "on" transition stored
+        self.assertEqual(events[0].new_state, "on")
+
+
+
+class TestHistoryRetentionConfig(unittest.TestCase):
+    """Tests for history retention configuration and cleanup behavior."""
+
+    def test_limits_config_fields(self):
+        from app.setup.models import LimitsConfig
+        from pydantic import ValidationError
+
+        # Test defaults
+        config = LimitsConfig()
+        self.assertEqual(config.history_backfill_days, 7)
+        self.assertEqual(config.cleanup_retention_days, 30)
+
+        # Test explicit values
+        config2 = LimitsConfig(history_backfill_days=30, cleanup_retention_days=60)
+        self.assertEqual(config2.history_backfill_days, 30)
+        self.assertEqual(config2.cleanup_retention_days, 60)
+
+        # Test out of range
+        with self.assertRaises(ValidationError):
+            LimitsConfig(cleanup_retention_days=99999)
+
+        with self.assertRaises(ValidationError):
+            LimitsConfig(history_backfill_days=-1)
+
+    @patch("app.patterns.scheduler.get_pattern_db")
+    @patch("app.config.get_settings")
+    def test_scheduler_cleanup_honors_retention(self, mock_settings, mock_get_db):
+        from app.patterns.scheduler import PatternScheduler
+
+        mock_db = mock_get_db.return_value
+        mock_db.cleanup_old_events.return_value = 5
+
+        scheduler = PatternScheduler("url", "token")
+
+        # Test cleanup_retention_days=45
+        mock_settings.return_value.cleanup_retention_days = 45
+        deleted = asyncio.run(scheduler._run_cleanup())
+        mock_db.cleanup_old_events.assert_called_once_with(days=45)
+        self.assertEqual(deleted, 5)
+
+        # Test cleanup_retention_days=0
+        mock_db.cleanup_old_events.reset_mock()
+        mock_settings.return_value.cleanup_retention_days = 0
+        deleted = asyncio.run(scheduler._run_cleanup())
+        mock_db.cleanup_old_events.assert_not_called()
+        self.assertEqual(deleted, 0)
+
+
 def run_tests():
     """Run all tests with verbose output."""
     loader = unittest.TestLoader()
@@ -1164,6 +1398,8 @@ def run_tests():
         TestEventCollector,
         TestPatternScheduler,
         TestIntegration,
+        TestHistoryBackfill,
+        TestHistoryRetentionConfig,
     ]
 
     for test_class in test_classes:
